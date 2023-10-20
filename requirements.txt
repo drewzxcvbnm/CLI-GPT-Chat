@@ -1,0 +1,5 @@
+halo
+openai
+argparse
+requests
+sseclient
