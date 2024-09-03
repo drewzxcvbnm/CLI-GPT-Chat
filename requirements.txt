@@ -3,3 +3,4 @@ openai
 argparse
 requests
 sseclient
+term_image
