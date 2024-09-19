@@ -16,8 +16,8 @@ from halo import Halo
 HIST_DIR = "/home/drewman/.config/"
 HIST_FILE_POSTFIX = ""
 HIST_FILE = lambda: HIST_DIR + "chatbuffer" + HIST_FILE_POSTFIX
-MODELS = {"3.5": "gpt-3.5-turbo","4": "gpt-4", "4-turbo": "gpt-4-turbo-preview", "4o": "gpt-4o"}
-DESC = "You are a helpful assistant."
+MODELS = {"3.5": "gpt-3.5-turbo","4": "gpt-4", "4-turbo": "gpt-4-turbo-preview", "4o": "gpt-4o", "o1": "o1-preview", "o1m": "o1-mini"}
+DESC = "You an assistant that is helpful."
 URL = "https://api.openai.com/v1/chat/completions"
 GPT_REQUEST_HEADERS = {
     "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
@@ -34,17 +34,31 @@ parser.add_argument("-ci", "--clipboard-image", help="Use clipboard as image sou
 parser.add_argument("input", help="Input prompt for chat", nargs="*")
 args = None 
 
+def detect_display_server():
+    if 'WAYLAND_DISPLAY' in os.environ:
+        return 'Wayland'
+    if 'DISPLAY' in os.environ:
+        return 'X11'
+    return 'Unknown'
+
+def get_clipboard_image_wayland():
+    result = subprocess.run(['wl-paste', '-t', 'image/png'], stdout=subprocess.PIPE, check=True)
+    image_data = result.stdout
+    return base64.b64encode(image_data).decode('utf-8')
+
+def get_clipboard_image_x11():
+    result = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'image/png', '-o'], stdout=subprocess.PIPE, check=True)
+    image_data = result.stdout
+    return base64.b64encode(image_data).decode('utf-8')
+
 def get_clipboard_image():
     try:
-        result = subprocess.run(['wl-paste', '-t', 'image/png'], stdout=subprocess.PIPE, check=True)
-        image_data = result.stdout
-        return base64.b64encode(image_data).decode('utf-8')
+        if detect_display_server() == 'X11':
+            return get_clipboard_image_x11()
+        return get_clipboard_image_wayland()
     except subprocess.CalledProcessError:
         print("Error: Couldn't get image from clipboard")
         sys.exit(1)
-
-
-
 
 class GPTFunctions:
 
@@ -188,12 +202,11 @@ def create_functions():
         functions.append(create_function(name, desc, fargs))
     return functions
 
+def model():
+    return MODELS[args.model]
 
-def make_request(user_line, function_messages=()):
-    with open(HIST_FILE(), 'a+') as f:
-        f.seek(0)
-        hist = [eval(i) for i in f]
-    api_line = {
+def get_api_line(user_line):
+    return {
         "role": "user", 
         "content": user_line if args.clipboard_image is False else [
             {
@@ -208,52 +221,110 @@ def make_request(user_line, function_messages=()):
             }
         ]
     }
-    messages = [
-        {"role": "system", "content": args.system}, 
-        *hist, 
-        api_line, 
-        *function_messages
-    ]
-    data = {
-        "model": MODELS[args.model],
-        "messages": messages,
-        "stream": True,
-        "functions": create_functions()
-    }
-    response = requests.post(URL, stream=True, headers=GPT_REQUEST_HEADERS, json=data)
-    client = sseclient.SSEClient(response)
-    events_generator = client.events()
-    resp_data = next(events_generator).data
-    try:
-        first_message = json.loads(resp_data)['choices'][0]['delta']
-    except Exception as e:
-        print(f"Got error: {e}")
-        print(f"Received data: {resp_data}")
-        sys.exit(1)
-    if first_message.get("function_call"):
-        complete_message = [json.loads(i.data)['choices'][0]['delta'] for i in events_generator if i.data != '[DONE]']
-        arguments = "".join([i['function_call']['arguments'] for i in complete_message if 'function_call' in i])
-        client.close()
-        function_name = first_message["function_call"]["name"]
-        function_response = call_function(function_name, json.loads(arguments))
-        function_call_message = {
-            "content": None,
-            "function_call": first_message["function_call"],
-            "role": "assistant",
-        }
-        function_response_message = {
-            "role": "function",
-            "name": function_name,
-            "content": str(function_response),
-        }
-        return make_request(user_line, (*function_messages, function_call_message, function_response_message))
 
+def get_hist():
+    with open(HIST_FILE(), 'a+') as f:
+        f.seek(0)
+        hist = [eval(i) for i in f]
+    return hist
+
+def gpt_function_call(complete_message, first_message):
+    arguments = "".join([i['function_call']['arguments'] for i in complete_message if 'function_call' in i])
+    function_name = first_message["function_call"]["name"]
+    function_response = call_function(function_name, json.loads(arguments))
+    function_call_message = {
+        "content": None,
+        "function_call": first_message["function_call"],
+        "role": "assistant",
+    }
+    function_response_message = {
+        "role": "function",
+        "name": function_name,
+        "content": str(function_response),
+    }
+    return (function_call_message, function_response_message)
+
+def create_message_generator(events_generator):
     def message_generator():
         for event in events_generator:
             if event.data != '[DONE]':
                 yield json.loads(event.data)['choices'][0]['delta']
-
     return message_generator()
+
+
+class SimpleO1Chat:
+
+    def make_request(self, user_line):
+        hist = get_hist()
+        api_line = get_api_line(user_line)
+        messages = self.get_messages(hist, api_line)
+        data = self.get_data(messages)
+        response = self.do_post(data)
+        return json.loads(response.text)['choices'][0]['message']['content']
+
+    def print_get_response(self, resp):
+        print(resp)
+        return resp
+
+    def get_data(self, messages):
+        return {
+            "model": model(),
+            "messages": messages,
+            "stream": False,
+        }
+
+    def get_messages(self, hist, api_line):
+        return [*hist, api_line]
+
+    def do_post(self, data):
+        return requests.post(URL, stream=False, headers=GPT_REQUEST_HEADERS, json=data)
+
+
+
+class NormalChat:
+
+    def make_request(self, user_line, function_messages=()):
+        hist = get_hist()
+        api_line = get_api_line(user_line)
+        messages = self.get_messages(hist, api_line, function_messages)
+        data = self.get_data(messages)
+        response = self.do_post(data)
+        client = sseclient.SSEClient(response)
+        events_generator = client.events()
+        resp_data = next(events_generator).data
+        first_message = json.loads(resp_data)['choices'][0]['delta']
+        if first_message.get("function_call"):
+            complete_message = [json.loads(i.data)['choices'][0]['delta'] for i in events_generator if i.data != '[DONE]']
+            client.close()
+            return self.make_request(user_line, (*function_messages, *gpt_function_call(complete_message, first_message)))
+        return create_message_generator(events_generator)
+
+
+    def print_get_response(self, resp):
+        complete_response = ""
+        for i in resp:
+            if 'content' in i:
+                complete_response += i['content']
+                for ch in i['content']:
+                    print(ch, end="", flush=True)
+                    time.sleep(0.004)
+        print("")
+        return complete_response
+
+    def get_data(self, messages):
+        return {
+            "model": model(),
+            "messages": messages,
+            "stream": True,
+            "functions": create_functions()
+        }
+
+    def get_messages(self, hist, api_line, function_messages):
+        sys = {"role": "system", "content": args.system}
+        return [sys, *hist, api_line, *function_messages]
+
+    def do_post(self, data):
+        return requests.post(URL, stream=True, headers=GPT_REQUEST_HEADERS, json=data)
 
 
 def main():
@@ -268,18 +339,12 @@ def main():
         print("Deleted history")
     if len(args.input) == 0:
         return
-    user_line = {"role": "user", "content": str.join(' ', args.input)}
-    response_generator = make_request(str.join(' ', args.input))
-    complete_response = ""
-    for i in response_generator:
-        if 'content' in i:
-            complete_response += i['content']
-            for ch in i['content']:
-                print(ch, end="", flush=True)
-                time.sleep(0.004)
-    print("")
+    user_line = str.join(' ', args.input)
+    chat = SimpleO1Chat() if model() in ('o1-preview', 'o1-mini') else NormalChat()
+    resp = chat.make_request(user_line)
+    complete_response = chat.print_get_response(resp)
     with open(HIST_FILE(), 'a') as f:
-        f.write(json.dumps(user_line) + '\n')
+        f.write(json.dumps(get_api_line(user_line)) + '\n')
         f.write(json.dumps({"role": "assistant", "content": complete_response}) + '\n')
 
 if __name__ == "__main__":
